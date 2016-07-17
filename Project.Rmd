@@ -1,0 +1,173 @@
+---
+title: "Machine-learning Classification of the Quality of Activities in the Weight Lifting Exercises Dataset"
+author: "Nigel Kerr"
+date: "July 15, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r, error=FALSE, warning=FALSE, echo=FALSE, results='hide', message=FALSE}
+library(caret, quietly = TRUE)
+library(randomForest, quietly = TRUE, verbose = FALSE)
+```
+
+## Introduction
+
+We are prompted to use machine-learning techniques from the course to attempt to correctly identify the quality of activities in the Weight Lifting Exercises Dataset [^1].  In the study, participants were made to perform a specific activity in 5 different ways: 1 correct, and the remaining 4 incorrect in 4 different specific ways, while sensors affixed to the participants recorded various bodily and geometric measures:
+
+> In each step of the sliding window approach
+we calculated features on the Euler angles (roll, pitch
+and yaw), as well as the raw accelerometer, gyroscope and
+magnetometer readings. For the Euler angles of each of the
+four sensors we calculated eight features: mean, variance,
+standard deviation, max, min, amplitude, kurtosis and skewness,
+generating in total 96 derived feature sets. [^1]
+
+These many variables are the inputs to machine-learning.  We are provided training and testing partitions of the dataset in the prompt.  The goal is to classify each observation in the testing partition into the correct 1 of the 5 ways.
+
+## Exploration and Data Preparation
+
+The prompt dataset provides some immediate challenges:
+
+1. a reasonable codebook or other detailed description doesn't appear to be available.
+2. some variables are only available on a few observations, being sliding-window bounds (as mentioned in the article quote above).  406 of the 19622 total observations are these sliding-window observations.  It is not apparent from looking at the training data which kinds of rows we will encounter in the test.
+3. There are some distressing values of '#DIV/0!' in particular variables of the sliding-window observations.  We will add this string to our values of NA.
+4. The data collection is inherently a measure of a physical process over time, and it is unclear at the outset how to think about this aspect vis-a-vis a classifier.  Each individual repetition of the movement is a time-series unto itself, and we don't know quite what to do with that at the moment.  It doesn't feel like a forecasting problem, really.
+
+The summary-type variables available only for the 406 sliding-window observations I will discard, having no good idea how to interpret them.  I will retain those observations, just not those variables.
+
+We choose also to discard the variables having to do with the sliding window ("new_window" and "num_window"), the row indicator ("X"), and unless we can think of way to incorporate them reasonably into a model, we will discard the timestamp and date-type variables (raw_timestamp_part_1, raw_timestamp_part_2, and cvtd_timestamp).  
+
+```{r, cache=TRUE, error=FALSE, warning=FALSE}
+train <- read.csv("pml-training.csv", na.strings = c("#DIV/0!", "NA"))
+
+
+slidingWindowVariables <-
+  grepl("^(kurtosis|skewness|max|min|amplitude|avg|var|stddev)_", 
+                  names(train))
+trainSubset1 <- train[,!slidingWindowVariables]
+
+otherUnwantedVariables <-
+  grepl("^(X|num_window|new_window|raw_timestamp_part_[12]|cvtd_timestamp)$", 
+                  names(trainSubset1))
+trainSubset2 <-  trainSubset1[,!otherUnwantedVariables]
+
+notComplete <- sum(!complete.cases(trainSubset2))
+notComplete
+```
+
+This leaves us with 1 factor variable identifying the participant, 1 factor variable identifying the activity quality class from the 5 we want to classify, and 52 numeric variables from the sensors.  There does not appear to be any other cleaning of values required, being no NA in the remaining data.
+
+This is an opportune moment to split this dataset with no NA in it anywhere into a train and validation set, so we can try whatever model we come up with on some data before the real test data.
+
+```{r, cache=TRUE, error=FALSE, warning=FALSE, message=FALSE}
+set.seed(2907)
+inTrain <- createDataPartition(y=trainSubset2$classe, p = 0.75, list = FALSE)
+trainSubset3 <- trainSubset2[inTrain,]
+validationSubset3 <- trainSubset2[-inTrain,]
+dim(trainSubset3)
+dim(validationSubset3)
+```
+
+
+As a practitioner of martial arts for many years, one intuition I have is that any set of measures of a body in motion are strongly related.  The effectiveness of a punch or kick depends on the entire body moving in concert.  The captured variable for the study's motion are no different, meaning that in possibly non-obvious ways, the variables are related.  The 52 numeric variables may have redundancies in them that don't help.
+
+This feels like a good place for seeing if there are variables that explain more of the variance with Singular Value Decomposition:
+
+
+```{r, cache=TRUE, error=FALSE, warning=FALSE, message=FALSE}
+showVarExpl <- function( svd ) {
+  par(mfrow = c(1,2))
+  plot(svd$d, xlab = "column", ylab="Singular value", pch = 19)
+  plot(svd$d^2/sum(svd$d^2), xlab="column", ylab="prop. of var explained", pch = 19)
+}
+# this is a data matrix of numeric only, the better to look at variance explained.
+dm1 <- subset(trainSubset3, select = !grepl("^(classe|user_name)$", names(trainSubset3)))
+svd1 <- svd(scale(dm1))
+showVarExpl(svd1)
+```
+
+This does show a couple winners, but no really clear break or knee-bend in the sequence.  So rather arbitrarily, we will limit ourselves to only those variables that together cumulatively explain 95% of the variance, which reduces our number of variables to just 20:
+
+```{r, cache=TRUE, error=FALSE, warning=FALSE, message=FALSE}
+# a hacked-down version of code presented at [^3]
+getMostInfluentialVars <- function( svd, quantile, useabsmax=TRUE ){
+  
+  perc_explained <- svd$d^2/sum(svd$d^2)
+  cols_expl <- which(cumsum(perc_explained) <= quantile)
+  
+  vars <- list()
+  require("Hmisc")
+  for (i in 1:length(perc_explained)){
+    v_abs <- abs(svd$v[,i])
+    if ( !useabsmax ) {
+      v_abs <- svd$v[,i]
+    }
+    maxContributor <- which.max(v_abs)
+    similarSizedContributors <- which(v_abs >= v_abs[maxContributor])
+    if (any(similarSizedContributors %nin% maxContributor)){
+      maxContributor <- 
+        similarSizedContributors[order(v_abs[similarSizedContributors], 
+                                       decreasing=TRUE)]
+    }
+    vars[[length(vars) + 1]] <- maxContributor
+  }
+  
+  return(unique(unlist(vars[cols_expl])))
+}
+
+infvars1 <- getMostInfluentialVars(svd1, quantile = .95)
+length(infvars1)
+infcolumns1 <- names(trainSubset3)[infvars1]
+
+trainSubset4 <- subset(trainSubset3, select = c("classe", "user_name", infcolumns1))
+validationSubset4 <- subset(validationSubset3, select = c("classe", "user_name", infcolumns1))
+```
+
+
+
+
+
+## Machine Learning
+
+This is a straight-forward classifcation task.  The intuition about the connectedness of physical movement rules out Naive Bayes, where there is an assumption of independence among the variables.  These measures of the body are not independent, so NB is not a good fit.
+
+A Random Forest method is attractive, it can be used for classification, and because by it's nature it includes cross-validation  (see about the randomForest package and its method to be used at [^2]), so we won't have to implement cross-validation ourselves.  Experience in Quiz 4 suggests that stacking may not get us very much more accuracy in the grand scheme, so we will confine ourselves here to one model, Random Forest.
+
+Making sure we've set random forest to have cross-validation, we train it on our sleeker train subset, then see what predictions and what accuracy the trained model makes for our sleek validation subset.
+
+```{r, cache=TRUE, error=FALSE, warning=FALSE, message=FALSE}
+set.seed(8675309)
+mod1 <- train(classe ~ ., 
+method = "rf", 
+data = trainSubset4, 
+trControl = trainControl(method = "cv"))
+```
+```{r, cache=TRUE, error=FALSE, warning=FALSE, message=FALSE}
+pred1 <- predict(mod1, newdata = validationSubset4)
+acc1 <- pred1 == validationSubset4$classe
+mean(acc1)
+```
+
+That accuracy of `r mean(acc1)` is not bad accuracy!  That should be enough to try the final test data on, so we'll repeat our transformations on the test data and predict with it.  The test dataset is much smaller, and doesn't have a classe variable, but a problem_id variable we'll use to submit responses:
+
+```{r, cache=TRUE, error=FALSE, warning=FALSE}
+test <- read.csv("pml-testing.csv", na.strings = c("#DIV/0!", "NA"))
+dim(test)
+testSubset1 <- subset(test, select = c("problem_id", "user_name", infcolumns1))
+pred2 <- predict(mod1, newdata = testSubset1)
+results1 <- data.frame(testSubset1$problem_id, pred2)
+results1
+```
+
+
+## References
+
+[^1]: Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+[^2]: http://www.inside-r.org/packages/cran/randomforest/docs/rfcv
+
+[^3]: http://www.r-bloggers.com/using-the-svd-to-find-the-needle-in-the-haystack/
+
